@@ -1,365 +1,205 @@
-#!/usr/bin/python
+#!/usr/bin/env python
+
+'''
+NANDOne - Xbox One (Codename: Durango) NAND dump parser / extractor
+* Maybe one day: " + decryptor"
+
+Credits:
+    noob25x / emoose: XVDTool (https://github.com/emoose/xvdtool)
+    various people: supplying nand dumps
+'''
+
+import io
+import os
+import sys
+import hashlib
+import uuid
+import binascii
+import argparse
+
+from construct import Int8ul, Int16ul, Int16ub
+from construct import Int32ul, Int32ub, Int64ul, Int64ub
+from construct import Bytes, Array, Padding, Struct
 
 APP_NAME = 'NANDOne'
-BUILD_VER = 'v0.02'
+BUILD_VER = 'v0.03'
 
-import sys
-import getopt
-import struct
-import os
-
-NAND_SIZE = 0x13C000000
-NAND_SPLIT = NAND_SIZE / 0x20
+FLASH_SIZE_LOG = 0x13BC00000
+FLASH_SIZE_RAW = 0x13C000000
 LOG_BLOCK_SZ = 0x1000
 
-MAGIC_SIZE = 0x4
+HEADER_SIZE = 1024
+HEADER_MAGIC = b'XBFS'
+HEADER_MAGIC = Int32ub.parse(HEADER_MAGIC)
 
-SFBX_MAGIC = 'SFBX'
-GFCX_MAGIC = 'GFCX'
-GFCU_MAGIC = 'GFCU'
+HEADER_HASH_SIZE = 32
+
+HEADER_OFFSETS = [0x10000,
+                0x810000,
+                0x820000]
+
+FLASH_FILES_COUNT = 25
+
 XVD_MAGIC = 'msft-xvd'
-
 XVD_MAGIC_START = 0x200
 
-SFBX_START = [0x810000,0x10000]
-SFBX_MAGIC_START = 0x0
 
-SFBX_ENTS_START = 0x10
+FlashFiles = [
+    "1smcbl_a.bin",     # 01 1st SMC bootloader, slot A
+    "header.bin",       # 02 Flash header
+    "devkit.ini",       # 03 devkit init
+    "mtedata.cfg",      # 04 MTE data ???
+    "certkeys.bin",     # 05 Certificate keys
+    "smcerr.log",       # 06 SMC error log
+    "system.xvd",       # 07 SystemOS xvd
+    "$sosrst.xvd",      # 08 SystemOS reset ???
+    "download.xvd",     # 09 Download xvd ???
+    "smc_s.cfg",        # 10 SMC config - signed
+    "sp_s.cfg",         # 11 SP config - signed
+    "os_s.cfg",         # 12 OS config - signed
+    "smc_d.cfg",        # 13 SMC config - decrypted
+    "sp_d.cfg",         # 14 SP config - decrypted
+    "os_d.cfg",         # 15 OS config - decrypted
+    "smcfw.bin",        # 16 SMC firmware
+    "boot.bin",         # 17 Main Bootloader ???
+    "host.xvd",         # 18 HostOS xvd
+    "settings.xvd",     # 19 Settings xvd
+    "1smcbl_b.bin",     # 20 1st SMC bootloader, slot B
+    "bootanim.dat",     # 21 Bootanimation
+    "sostmpl.xvd",      # 22 SystemOS template xvd
+    "update.cfg",       # 23 Update config / log?
+    "sosinit.xvd",      # 24 SystemOS init xvd
+    "hwinit.cfg"        # 25 Hardware init config
+]
 
-SFBX_BLOB_START = 0x3C0
-SFBX_BLOB_SIZE = 0x40
 
-SFBX_EN_SIZE = 0x10
-SFBX_EN_LBA_START = 0x0 
-SFBX_EN_SZ_START = 0x4 
+# offset and size need to be multiplied by LOG_BLOCK_SZ
+FlashFileEntry = Struct(
+    "offset" / Int32ul,
+    "size" / Int32ul,
+    "unknown" / Int64ul
+)
 
-SFBX_ENTS_MAXCNT_FIX = 0x3B
+FlashHeader = Struct(
+    # HEADER_MAGIC
+    "magic" / Int32ul,
+    "format_version" / Int8ul,
+    "sequence_version" / Int8ul,
+    "layout_version" / Int16ul,
+    "unknown_1" / Int64ul,
+    "unknown_2" / Int64ul,
+    "unknown_3" / Int64ul,
+    "files" / Array(FLASH_FILES_COUNT, FlashFileEntry),
+    Padding(544),
+    # GUID
+    "guid" / Bytes(16),
+    # SHA256 checksum
+    "hash" / Bytes(HEADER_HASH_SIZE)
+)
 
-GFCU_MAGIC_START = 0x28
-GFCU_ENTS_START = 0xF0
+class DurangoNand(object):
+    extract_info_str = " ... extracting ..."
+    def __init__(self, filename):
+        self._filename = filename
 
-GFCU_BLOB_START = 0xAD8
-GFCU_BLOB_SIZE = 0x64
+    @property
+    def filename(self):
+        return self._filename
+    
+    @property
+    def filesize(self):
+        st = os.stat(self.filename)
+        return st.st_size
 
-GFCU_EN_SIZE = 0x4C
-GFCU_EN_FN_START = 0x0
-GFCU_EN_FN_LENGTH = 0x40
-GFCU_EN_SIZE_START = 0x40
-GFCU_EN_BLOCK_START = 0x44
-GFCU_EN_UNKNOWN_START = 0x48
-GFCU_EN_EOF_START = 0x4
-GFCU_EN_EOF_MAGIC = 0x3FF
+    @property
+    def file_exists(self):
+        return os.path.isfile(self.filename)
 
-GFCU_ENTS_MAXCNT = 0x100
+    def _hash(self, data):
+        return hashlib.sha256(data).digest()
 
-gfcu_arr = []
-sfbx_arr = []
+    def extract_file(self, flash_fd, offset, size, dirname, filename):
+        # Read file from nanddump
+        flash_fd.seek(offset)
+        buf = flash_fd.read(size)
+        # Write file to destination path
+        try:
+            os.mkdir(dirname)
+        except FileExistsError as e:
+            pass
 
-KRNL_VER_START = 0x30
-KRNL_VER_LENGTH = 0x70
+        dest_path = os.path.join(dirname, filename)
+        with open(dest_path, "wb") as dest_fd:
+            dest_fd.write(buf)
+            dest_fd.flush()
 
-def ReverseByteOrder(data):
-	dstr = hex(data)[2:].replace('L','')
-	byteCount = len(dstr[::2])
-	val = 0
-	for i, n in enumerate(range(byteCount)):
-		d = data & 0xFF
-		val |= (d << (8 * (byteCount - i - 1)))
-		data >>= 8
-	return val
+    def parse_fileheader(self, header, flash_fd, do_extract=False):
+        guid = uuid.UUID(bytes=header.guid)
+        hash = binascii.hexlify(header.hash).decode('utf-8')
 
-def ReadUInt16_LE(data,addr):
-	return struct.unpack('<H', data[addr:addr+2])[0]
+        print("Format Version: %i" % header.format_version)
+        print("Sequence Version: %i" % header.sequence_version)
+        print("Layout Version: %i" % header.layout_version)
+        print("GUID: %s" % guid)
+        print("Hash: %s" % hash)
 
-def ReadUInt16_BE(data,addr):
-	return struct.unpack('>H', data[addr:addr+2])[0]
+        print("- Files:")
+        for idx, name in enumerate(FlashFiles):
+            offset = header.files[idx].offset * LOG_BLOCK_SZ
+            size = header.files[idx].size * LOG_BLOCK_SZ
+            if not size:
+                print("Not found - file: %s" % name)
+                continue
+            print("off: 0x%08x, sz: 0x%08x, file: %s %s" % (
+                  offset, size, name,
+                  self.extract_info_str if do_extract else ""))
 
-def ReadUInt32_LE(data,addr):
-	return struct.unpack('<I', data[addr:addr+4])[0]
+            if do_extract:
+                self.extract_file(flash_fd, offset, size, 
+                                  self.filename + "_" + str(guid), name)
 
-def ReadUInt32_BE(data,addr):
-	return struct.unpack('>I', data[addr:addr+4])[0]
+    def parse(self, do_extract):
+        if len(FlashFiles) != FLASH_FILES_COUNT:
+            print("ERROR: FlashFiles count is incorrect!")
+            print("Got %i instead of expected %i entries" % (len(FlashFiles), FLASH_FILES_COUNT))
+            return
 
-def ReadString(data,addr,size):
-	return data[addr:addr+size]
+        if not self.file_exists:
+            print("ERROR: file %s does not exist!" % nand.filename)
+            return
 
-def GetFilesize(fn):
-	st = os.stat(fn)
-	return st.st_size
+        if self.filesize == FLASH_SIZE_LOG:
+            print("Nanddump type: Logical")
+        elif self.filesize == FLASH_SIZE_RAW:
+            print("Nanddump type: Raw")
+        else:
+            print("ERROR: file does not match expected filesize!")
+            print("Got 0x%x instead of expected 0x%x bytes" % (self.filesize, FLASH_SIZE))
+            return
 
-def FileExists(fn):
-	return os.path.isfile(fn)
-	
-def MakeDir(path):
-	try:
-		os.makedirs(path)
-	except OSError:
-		if not os.path.isdir(path):
-			raise
-
-def CheckMagic(indata, pos, magic):
-	read = ReadUInt32_LE(indata, pos)
-	comp = ReadUInt32_LE(magic, 0)
-	if read != comp:
-		return -1
-	return 0
-
-def ReadFile(fn, start, length):
-	file = open(fn, 'r+b')
-	file.seek(start)
-	data = file.read(length)
-	file.close()
-	return data
-
-def ScanForSFBX(fn):
-	file = open(fn, 'r+b')
-	sfbx_addr = 0
-	for i in xrange(NAND_SIZE/NAND_SPLIT):
-		file.seek(i*NAND_SPLIT)
-		buf = file.read(NAND_SPLIT)
-		for j in xrange(0,(NAND_SPLIT-LOG_BLOCK_SZ), LOG_BLOCK_SZ):
-			sfbx_magic = ReadString(buf, j,len(SFBX_MAGIC))
-			if(CheckMagic(sfbx_magic, SFBX_MAGIC_START, SFBX_MAGIC) == 0):
-				sfbx_addr = j + (i * NAND_SPLIT)
-				break
-	file.close()
-	return sfbx_addr
-	
-def GetSizeSFBX(fn, addr):
-	if(addr == 0):
-		return 0
-	for i in xrange(SFBX_ENTS_MAXCNT_FIX):
-		total_pos = addr + i * SFBX_EN_SIZE
-		entry = ReadFile(fn, total_pos, SFBX_EN_SIZE)
-
-		lba = ReadUInt32_LE(entry, SFBX_EN_LBA_START)
-		sz = ReadUInt32_LE(entry, SFBX_EN_SZ_START)
-		if ((lba*LOG_BLOCK_SZ) == addr):
-			return (sz * LOG_BLOCK_SZ) / 0x10 # Needs division by 0x10
-	return 0
-	
-def DumpSFBX(fn):
-	for i in xrange(len(SFBX_START)):
-		sfbx_magic = ReadFile(fn, SFBX_START[i], len(SFBX_MAGIC))
-		if(CheckMagic(sfbx_magic, SFBX_MAGIC_START, SFBX_MAGIC) == 0):
-			sfbxaddr = SFBX_START[i]
-			break
-		if (i == len(SFBX_START)-1):
-			print('SFBX data wasn\'t found. Scanning for it!')
-			sfbxaddr = ScanForSFBX(fn)
-			break
-		
-	sfbxsize = GetSizeSFBX(fn,sfbxaddr)
-	sfbxaddr = sfbxaddr + SFBX_ENTS_START # Don't want the header
-	
-	if(sfbxsize == 0):
-		print('Size of SFBX wasn\'t found in Adresstable')
-		return 0
-		
-	sfbx_ents_size = sfbxsize - SFBX_BLOB_SIZE - SFBX_ENTS_START
-	sfbx_ents_maxcnt = sfbx_ents_size / SFBX_EN_SIZE
-		
-	#Read adresses in array		
-	for j in xrange(sfbx_ents_maxcnt):
-		total_pos = sfbxaddr + j * SFBX_EN_SIZE
-		entry = ReadFile(fn, total_pos, SFBX_EN_SIZE)
-
-		lba = ReadUInt32_LE(entry, SFBX_EN_LBA_START)
-		sz = ReadUInt32_LE(entry, SFBX_EN_SZ_START)
-			
-		fileaddr = lba * LOG_BLOCK_SZ
-			
-		# msft-xvd magic doesnt start at 0x0!
-		xvd = ReadFile(fn, fileaddr+XVD_MAGIC_START, len(XVD_MAGIC))
-		if(xvd == XVD_MAGIC):
-			magic = 'XVD'
-		else:
-			magic = ReadFile(fn, fileaddr, MAGIC_SIZE)
-			
-		sfbx_arr.append([])
-		sfbx_arr[-1].append(total_pos)
-		sfbx_arr[-1].append(lba)
-		sfbx_arr[-1].append(sz)
-		sfbx_arr[-1].append(magic)
-	return j-1
-
-def ExtractSFBXData(fn):
-	infile = open(fn, 'r+b')
-	foldername = os.path.basename(fn).replace('.','_')
-	MakeDir(foldername)
-	for i in xrange(len(sfbx_arr)):
-		if (sfbx_arr[i][2] != 0): # Only extract if entry holds a size
-			addr = sfbx_arr[i][1] * LOG_BLOCK_SZ
-			size = sfbx_arr[i][2] * LOG_BLOCK_SZ
-			magic = sfbx_arr[i][3]
-			
-			if (magic.isalpha()):
-				ext = magic
-			else:
-				ext = 'BIN'
-
-			fn_out = '{:X}_{:X}.{}'.format(addr,addr+size,ext)
-				
-			path_out = os.path.join(foldername, fn_out)
-			
-			outfile = open(path_out, 'w+b')
-			print('Extracting @ {:#08x}, size: {}kb to \'{}\''.\
-					format(addr,size/1024,fn_out))
-					
-			infile.seek(addr)
-			outfile.write(infile.read(size))	
-			outfile.close()
-	infile.close()
-
-def PrintSFBX():
-	print('\nSFBX Entries')
-	print('-----------\n')
-	for i in xrange(len(sfbx_arr)):
-		if (sfbx_arr[i][2] == 0):
-			continue                                               
-		print('Entry 0x{0:02X} : found @ pos: {1:08X}'.\
-				format(i, sfbx_arr[i][0]))
-		print('\tLBA: {0:08X} (addr {1:09X})'.\
-				format(sfbx_arr[i][1], (sfbx_arr[i][1] * LOG_BLOCK_SZ)))
-		print('\tSize: {0:08X} ({0} Bytes, {1}kB, {2}MB)'.\
-				format((sfbx_arr[i][2] * LOG_BLOCK_SZ),\
-					(sfbx_arr[i][2] * LOG_BLOCK_SZ)/1024,\
-					(sfbx_arr[i][2] * LOG_BLOCK_SZ)/1024/1024))
-		if (sfbx_arr[i][3].isalpha()):
-			print('*** MAGIC: {0} ***'.\
-				format(sfbx_arr[i][3]))
-
-# Returns: total addr, total_size 		
-def GetEntryByMagic(magic):
-	for i in xrange(len(sfbx_arr)):
-		if (sfbx_arr[i][3] == magic):
-			return (sfbx_arr[i][1] * LOG_BLOCK_SZ),\
-					(sfbx_arr[i][2] * LOG_BLOCK_SZ)
-	return 0
-
-# Returns: total_size
-def GetEntryByAddr(addr):
-	for i in xrange(len(sfbx_arr)):
-		if ((sfbx_arr[i][1] * LOG_BLOCK_SZ) == addr):
-			return (sfbx_arr[i][2] * LOG_BLOCK_SZ)
-	return 0
-
-def DumpKernelVer(data):
-	return ReadString(data,KRNL_VER_START, KRNL_VER_LENGTH)
-
-def DumpGFCU(data,startaddr):
-	for i in xrange(GFCU_ENTS_MAXCNT):
-		pos = startaddr + i*GFCU_EN_SIZE
-		entry = data[pos:pos+GFCU_EN_SIZE]
-
-		eof = ReadUInt32_LE(entry, GFCU_EN_EOF_START)
-		if (eof == GFCU_EN_EOF_MAGIC):
-			return i-1
-
-		fn = ReadString(entry, GFCU_EN_FN_START, GFCU_EN_FN_LENGTH)
-		sz = ReadUInt32_LE(entry, GFCU_EN_SIZE_START)
-		blk = ReadUInt32_LE(entry, GFCU_EN_BLOCK_START)
-		un = ReadUInt32_LE(entry, GFCU_EN_UNKNOWN_START)
-
-		gfcu_arr.append([])
-		gfcu_arr[-1].append(pos)
-		gfcu_arr[-1].append(fn)
-		gfcu_arr[-1].append(sz)
-		gfcu_arr[-1].append(blk)
-		gfcu_arr[-1].append(un)
-		
-	return i-1
-				
-def PrintGFCU():
-	print('\nGFCU Entries')
-	print('-----------\n')
-	for i in xrange(len(gfcu_arr)):	                                               
-		print('Entry 0x{0:02X} : found @ pos: {1:08X}'.\
-				format(i, gfcu_arr[i][0]))
-		print('\tfilename: {0} (size: {1:09X})'.\
-				format(gfcu_arr[i][1], (gfcu_arr[i][2] * LOG_BLOCK_SZ)))
-		print('\tBlock: {0:08X} Unknown: {0:08X}'.\
-				format((gfcu_arr[i][3] * LOG_BLOCK_SZ),\
-					(gfcu_arr[i][4] * LOG_BLOCK_SZ)))
-
-def FindGFCU():
-	gfcx_addr, gfcx_size = GetEntryByMagic(GFCX_MAGIC)
-	if (gfcx_addr == 0):
-		print ('\nGFCX MAGIC not found. Exiting!')
-		return -1
-
-	gfcu_addr = gfcx_addr + gfcx_size
-	gfcu_size = GetEntryByAddr(gfcu_addr)
-
-	if (gfcu_size == 0):
-		print ('\nGFCU Entry not found. Exiting!')
-		return -2
-
-	gfcu = ReadFile(filename, gfcu_addr, gfcu_size)
-	if CheckMagic(gfcu, GFCU_MAGIC_START, GFCU_MAGIC) == -1:
-		print ('\nGFCU MAGIC not found. Exiting!')
-		return -3
-
-	print('\nParsing GFCU Entries... ')
-	gfcu_len = DumpGFCU(gfcu,GFCU_ENTS_START)
-	print('\nFound {} Entries'.format(gfcu_len))
-	print('\nXbox ONE Kernel-Version: {}'.format(DumpKernelVer(gfcu)))
-	return gfcu_len
-					
-action_arr =	['info', 'Prints the parsed entries'],\
-				['extract','Extracts nand content']
-
-def PrintUsage():
-	print('Usage:')
-	print('\t{0} [action] [dump]'.format(sys.argv[0]))
-	print('\nAvailable Action:')
-	for i in xrange(len(action_arr)):
-		print ('\t{0}\t\t{1}'.format(action_arr[i][0], action_arr[i][1]))
-	print('\nExample:')
-	print('\t{0} {1} nanddump.bin'.format(sys.argv[0], action_arr[0][0]))
+        print("Nanddump file: %s" % self.filename)
+        f = io.open(self.filename, "rb")
+        # Search for fixed-offset filesystem header
+        for offset in HEADER_OFFSETS:
+            f.seek(offset)
+            data = f.read(HEADER_SIZE)
+            header = FlashHeader.parse(data)
+            if header.magic != HEADER_MAGIC:
+                continue
+            print("-- Filesystem Header @ 0x%x" % offset)
+            hash = self._hash(data[:-HEADER_HASH_SIZE])
+            if hash != header.hash:
+                # Just warn but try to parse anyways
+                print("WARNING: Hash of header does not match")
+            output = self.parse_fileheader(header, f, do_extract)
+        f.close()
 
 if __name__ == '__main__':
-	print('{} {} started\n'.format(APP_NAME, BUILD_VER))
-	if len(sys.argv) != 3:
-		PrintUsage()
-		sys.exit(-1)
-	for i in xrange(len(action_arr)):
-		if (sys.argv[1] == action_arr[i][0]):
-			break
-		elif (i == len(action_arr)-1):
-			print('ERROR: [action] parameter is invalid!\n')
-			PrintUsage()
-			sys.exit(-2)
-	if (FileExists(sys.argv[2]) == 0):
-		print('ERROR: file \'{}\' doesn\'t exist\n'.format(sys.argv[2]))
-		PrintUsage()
-		sys.exit(-3)
-		
-############
-### MAIN ###
-############
+    parser = argparse.ArgumentParser(description='Parse raw Durango Nanddump')
+    parser.add_argument('filename', type=str, help='input filename')
+    parser.add_argument('--extract', action='store_true', help='extract files from nand')
+    print("%s %s started" % (APP_NAME, BUILD_VER))
 
-action = sys.argv[1]
-filename = sys.argv[2]
-
-print('Opening \'{}\''.format(filename))
-
-if (GetFilesize(filename) != NAND_SIZE):
-	print('Invalid filesize. Aborting!')
-	sys.exit(-4)
-
-print('\nParsing SFBX Entries... ')
-sfbx_len = DumpSFBX(filename)
-if (sfbx_len == 0):
-	print('SFBX not found! Aborting!\n')
-	sys.exit(-4)
-print('Found {} Entries\n'.format(sfbx_len))
-	
-
-if (action == action_arr[0][0]): # 'info'
-	PrintSFBX()
-	if (FindGFCU() <= 0):
-		sys.exit(-4)
-	PrintGFCU()
-elif (action == action_arr[1][0]): # 'extract'
-	ExtractSFBXData(filename)
+    args = parser.parse_args()
+    nand = DurangoNand(args.filename)
+    nand.parse(args.extract)

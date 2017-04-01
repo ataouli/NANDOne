@@ -1,45 +1,42 @@
-NANDOne v0.02
+NANDOne v0.03
 ===========
 
 Xbox One NAND Filesystem tool
 
-Parses Xbox One Nanddumps for file-adresses and extracts the binary
-files. As I only had two dumps to work with, it's probably not
-universally compatible and contains bugs for sure :P
+Parses Xbox One Nanddumps for filesystem header and extracts the binary
+files. It's probably not very compatible and contains bugs for sure :P
 
 Enjoy!
 
 
 Requirements
 ===========
- * Python 2.7
+ * Python 3.*
  * Xbox One eMMC NAND Dump
-
-
-Actions
-===========
-	info		Reads adresses from SFBX and GFCU Table and prints them
-				to screen
-	
-	extract		Extracts the parsed entries from SFBX Table
-
+ * Python libs: construct
 
 Usage
 ===========
-Usage:
-	NANDOne.py [action] [dump]
+nandone.py [-h] [--extract] filename
 
-Available Action:
-	info		Prints the parsed entries
-	extract		Extracts nand content
+Flags:
+
+-h 			Help
+
+--extract 	Extract found files
 
 Example:
-	NANDOne.py info nanddump.bin
+nandone.py --extract nanddump.bin
 
 
 Changelog
 ===========
-v0.xx
+v0.03
+- Major rewrite
+- Scan for filesystem header at ?all? 3 offsets
+- Extract files by name
+
+v0.02
 - ExtractSFBXdata: Extracting the bootblock @ addr 0x0
 - mmap: Fixing memory issues on 32bit systems by reading in chunks
 - DumpSFBX: SFBX size is now read dynamically, not fixed anymore
@@ -47,9 +44,9 @@ v0.xx
 - XVD header gets detected and printed in info output
 - Filetype-magic is appended to extracted filenames
 - Some cleanup
-v0.02
 - Support for parsing and extracting SFBX entries
 - Possibility to scan for SFBX block
 - Additional error checking
+
 v0.01
 - Initial release
